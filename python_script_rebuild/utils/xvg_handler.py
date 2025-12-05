@@ -1,18 +1,63 @@
 import os
 import time
 import io
+import colorsys
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import numpy as np
 import pandas as pd
 from scipy import stats
 
 
 class XVG:
     """
-    XVG 类：用于解析和处理 GROMACS xvg 文件。
-    基于 Pandas 进行了深度优化，以实现高性能数据处理。
+    XVG 文件处理核心类。
+
+    该类集成了 GROMACS .xvg 文件的解析、数据处理、可视化（绘图）以及文件合并功能。
+    底层数据结构基于 Pandas DataFrame，以实现高效的向量化计算。
+
+    Attributes:
+        xvgfile (str): XVG 文件路径。
+        comments (List[str]): 文件头部的注释行（以 # 开头）。
+        title (str): 图表标题（@ title）。
+        xlabel (str): X 轴标签（@ xaxis label）。
+        ylabel (str): Y 轴标签（@ yaxis label）。
+        legends (List[str]): 图例列表（@ s[n] legend）。
+        df (pd.DataFrame): 存储数值数据的 DataFrame。
     """
+
+    # =========================================================================
+    #  全局配置 (Global Configuration)
+    # =========================================================================
+
+    # 绘图样式默认配置
+    STYLE_CONFIG = {
+        "figsize": (12, 7),
+        "dpi": 120,
+        "title_fontsize": 16,
+        "label_fontsize": 14,
+        "tick_fontsize": 11,
+        "grid_alpha": 0.3,
+        "line_width": 2.5,
+        "scatter_size": 10,
+        "window_size": 100,  # 默认滑动平均窗口大小
+    }
+
+    # 预设颜色映射表 (用于自动配色)
+    COLORMAP_MAP = {
+        "professional": "viridis",  # 专业、学术风 (蓝-绿-黄)
+        "bright": "tab10",  # 高对比度 (Matplotlib 默认)
+        "pastel": "Pastel1",  # 柔和色系
+        "cool": "coolwarm",  # 冷暖渐变 (红-蓝)
+        "default": "jet",  # 经典彩虹色
+    }
+
+    # =========================================================================
+    #  初始化与核心属性 (Initialization & Properties)
+    # =========================================================================
 
     def __init__(
         self,
@@ -20,6 +65,17 @@ class XVG:
         is_file: bool = True,
         new_file: bool = False,
     ) -> None:
+        """
+        初始化 XVG 对象。
+
+        Args:
+            xvgfile: XVG 文件的路径。
+            is_file: 是否视为真实文件进行读取。默认为 True。
+            new_file: 是否创建一个新的空 XVG 对象（不读取磁盘文件）。默认为 False。
+
+        Raises:
+            FileNotFoundError: 当 is_file=True 且文件不存在时抛出。
+        """
         self.xvgfile = xvgfile
         self.comments: List[str] = []
         self.title: str = ""
@@ -27,10 +83,10 @@ class XVG:
         self.ylabel: str = ""
         self.legends: List[str] = []
 
-        # 数据存储：使用 Pandas DataFrame 代替旧版的 list of lists
+        # 数据存储：使用 Pandas DataFrame 初始化为空
         self.df: pd.DataFrame = pd.DataFrame()
 
-        # 元数据默认值
+        # GROMACS 视图/视口设置默认值
         self.view: str = "0.15, 0.15, 0.75, 0.85"
         self.world_xmin: Optional[float] = None
         self.world_xmax: Optional[float] = None
@@ -40,32 +96,32 @@ class XVG:
         if not new_file and is_file:
             if not os.path.exists(xvgfile):
                 raise FileNotFoundError(f"未检测到文件 {xvgfile}！")
-
-            # 使用分离式解析方法
             self._load_xvg()
 
     @property
     def row_num(self) -> int:
-        """返回数据行数"""
+        """获取数据行数。"""
         return self.df.shape[0]
 
     @property
     def column_num(self) -> int:
-        """返回数据列数"""
+        """获取数据列数。"""
         return self.df.shape[1]
 
     @property
     def data_heads(self) -> List[str]:
-        """基于标签和图例生成表头列表"""
+        """
+        基于 xlabel 和 legends 智能生成表头列表。
+        用于调试或导出数据时识别列含义。
+        """
         heads = [self.xlabel] if self.xlabel else ["X"]
 
         if self.legends:
             heads.extend(self.legends)
         elif self.ylabel:
-            # 如果有多列数据但只有一个 ylabel，进行适当处理
+            # 如果有多列数据但只有一个 ylabel，尝试自动编号
             if self.column_num > 1:
                 heads.append(self.ylabel)
-                # 如果还有剩余列，自动填充命名
                 for i in range(2, self.column_num):
                     heads.append(f"{self.ylabel}_{i}")
         return heads
@@ -73,63 +129,68 @@ class XVG:
     @property
     def data_columns(self) -> List[List[float]]:
         """
-        向后兼容属性：
-        将数据以 list of lists (列优先) 的形式返回，以兼容旧代码。
+        [向后兼容] 将 DataFrame 数据转换为 List of Lists (按列优先)。
+
+        Returns:
+            List[List[float]]: 包含每一列数据的列表。
         """
         if self.df.empty:
             return []
         return [self.df[col].tolist() for col in self.df.columns]
 
+    # =========================================================================
+    #  文件 I/O (File I/O)
+    # =========================================================================
+
     def _load_xvg(self) -> None:
         """
-        高效加载 XVG 文件：
-        将元数据（Metadata）与数值数据（Data）分离解析。
+        内部方法：高效加载 XVG 文件。
+        策略：先分离元数据行，再使用 pandas.read_csv 批量读取数值部分。
         """
         metadata_lines = []
         data_buffer = []
 
-        # 1. 读取文件并分离注释/元数据与数据
         with open(self.xvgfile, "r", encoding="UTF-8") as f:
             for line in f:
                 sline = line.strip()
                 if not sline:
                     continue
+                # 分离元数据行（以 # 或 @ 开头）
                 if sline.startswith(("#", "@")):
                     metadata_lines.append(sline)
                 else:
                     data_buffer.append(line)
 
-        # 2. 解析元数据
+        # 1. 解析元数据
         self._parse_metadata(metadata_lines)
 
-        # 3. 使用 Pandas 解析数据 (向量化操作，速度极快)
+        # 2. 解析数值数据
         if data_buffer:
-            # 使用 io.StringIO 将字符串缓冲作为文件对象处理
             csv_io = io.StringIO("".join(data_buffer))
             try:
                 # sep=r"\s+" 处理不定长空格分隔符
                 self.df = pd.read_csv(csv_io, sep=r"\s+", header=None)
             except Exception as e:
                 raise ValueError(f"解析文件 {self.xvgfile} 中的数据失败: {e}")
-
             print(f"成功解析 {self.xvgfile}: {self.row_num} 行, {self.column_num} 列。")
         else:
             print(f"警告: {self.xvgfile} 仅包含元数据。")
 
     def _parse_metadata(self, lines: List[str]) -> None:
-        """解析 GROMACS 特有的元数据行 (@ 和 #)"""
+        """解析 GROMACS 特有的元数据语法。"""
         title_flag = False
         xlabel_flag = False
         ylabel_flag = False
+
         for line in lines:
             if line.startswith("#"):
                 self.comments.append(line)
                 continue
 
-            # 解析 '@' 命令
             if line.startswith("@"):
                 clean_line = line.lstrip("@").strip()
 
+                # 解析标题、轴标签、图例等
                 if 'title "' in line and not title_flag:
                     self.title = line.split('"')[-2]
                     title_flag = True
@@ -140,7 +201,6 @@ class XVG:
                     self.ylabel = line.split('"')[-2]
                     ylabel_flag = True
                 elif ' legend "' in line:
-                    # 例如: @ s0 legend "Potential"
                     self.legends.append(line.split('"')[-2])
                 elif " view " in line:
                     self.view = clean_line.replace("view", "").strip()
@@ -148,15 +208,19 @@ class XVG:
                     self.world_xmin = float(line.split()[-1])
 
     def save(self, outxvg: str, check: bool = True) -> None:
-        """将 XVG 类转储（保存）到文件"""
-        if check:
-            if self.df.empty:
-                raise ValueError("无法保存空的 XVG 数据。")
+        """
+        将当前对象状态保存为符合 GROMACS 格式的 .xvg 文件。
 
-        # 确保图例数量与数据列（不含X轴）对齐
+        Args:
+            outxvg: 输出文件路径。
+            check: 是否检查数据为空。默认为 True。
+        """
+        if check and self.df.empty:
+            raise ValueError("无法保存空的 XVG 数据。")
+
+        # 确保图例数量与数据列对应 (补全缺失的图例)
         data_col_count = self.column_num - 1
         if len(self.legends) < data_col_count:
-            # 自动生成缺失的图例
             base_label = self.ylabel if self.ylabel else "Data"
             for i in range(len(self.legends), data_col_count):
                 self.legends.append(f"{base_label}_{i}")
@@ -164,7 +228,7 @@ class XVG:
         time_info = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
         with open(outxvg, "w", encoding="UTF-8") as fo:
-            # 写入文件头 (Header)
+            # 1. 写入头部信息
             fo.write(f"# This file was created at {time_info}\n")
             for comm in self.comments:
                 fo.write(f"{comm}\n" if not comm.endswith("\n") else comm)
@@ -182,14 +246,9 @@ class XVG:
             for i, leg in enumerate(self.legends):
                 fo.write(f'@ s{i} legend "{leg}"\n')
 
-            # 写入数据 (Data)
-            # 使用循环进行精确的格式控制 (模拟原始 GROMACS 格式)
-            # 标准的 pandas to_csv 可能无法完美对齐空格
-
-            # 转为 numpy 数组进行迭代比 df.iterrows 更快
+            # 2. 写入数值数据 (模拟 GROMACS 格式对齐)
             np_data = self.df.values
             for row in np_data:
-                # 自定义格式化：通常第一列是时间（整数或浮点），其余为数据
                 line_str = ""
                 for val in row:
                     if val.is_integer():
@@ -200,50 +259,64 @@ class XVG:
 
         print(f"XVG 文件已成功保存至 {outxvg}。")
 
+    # =========================================================================
+    #  数据计算与处理 (Computation)
+    # =========================================================================
+
     def calc_mvave(
         self, windowsize: int, confidence: float, column_index: int
     ) -> Tuple[List[float], List[float], List[float]]:
         """
-        使用 Pandas 向量化操作计算移动平均。
-        显著快于基于循环的方法。
+        计算移动平均 (Moving Average) 及其置信区间。
+
+        Args:
+            windowsize: 窗口大小（数据点个数）。
+            confidence: 置信度 (0 < c < 1)，用于计算标准差范围。
+            column_index: 要计算的列索引 (通常 1 为 Y 轴数据)。
+
+        Returns:
+            Tuple[List[float], List[float], List[float]]:
+            (平均值列表, 上界列表, 下界列表)。
+            列表前端不足窗口大小的部分为 NaN。
         """
         if windowsize <= 0 or windowsize > self.row_num // 2:
             raise ValueError("窗口大小 (windowsize) 设置不当。")
         if not (0 < confidence < 1):
             raise ValueError("置信度 (confidence) 必须在 (0, 1) 之间。")
-        if column_index >= self.column_num:
-            raise ValueError("列索引 (column_index) 超出范围。")
+        self.check_column_index(column_index)
 
-        # 提取 Series
         series = self.df.iloc[:, column_index]
 
-        # 向量化滚动计算
-        # min_periods=windowsize 模拟了起始处存在 NaN 的行为
+        # 使用 Pandas rolling 进行向量化计算
         rolling = series.rolling(window=windowsize)
         mvaves = rolling.mean()
         stds = rolling.std()
 
-        # 计算置信区间
-        # ppf: 百分位点函数 (CDF 的反函数)
+        # 计算置信区间 Z-Score
         z_score = stats.norm.ppf((1 + confidence) / 2)
-
         lows = mvaves - (z_score * stds)
         highs = mvaves + (z_score * stds)
 
-        # 返回列表以匹配原始函数的返回签名
         return mvaves.tolist(), highs.tolist(), lows.tolist()
 
     def calc_ave(
         self, begin: int, end: int, dt: int, column_index: int
     ) -> Tuple[str, float, float]:
-        """利用切片计算选定列的平均值"""
-        if column_index >= self.column_num:
-            raise ValueError(f"列索引 {column_index} 超出范围。")
+        """
+        计算选定区间内某列数据的平均值和标准差。
 
-        # 处理切片用的 None
+        Args:
+            begin: 起始行索引。
+            end: 结束行索引 (None 表示到末尾)。
+            dt: 步长。
+            column_index: 列索引。
+
+        Returns:
+            Tuple[str, float, float]: (图例名称, 平均值, 标准差)。
+        """
+        self.check_column_index(column_index)
+
         s_end = end if end is not None else self.row_num
-
-        # DataFrame 切片操作基本是 O(1) 的
         subset = self.df.iloc[begin:s_end:dt, column_index]
 
         legend = (
@@ -257,118 +330,273 @@ class XVG:
         return legend, ave, std
 
     def check_column_index(self, column_index: int) -> None:
-        """检查列索引是否有效"""
+        """辅助方法：检查列索引合法性。"""
         if column_index < 0 or column_index >= self.column_num:
             raise ValueError(
                 f"列索引 {column_index} 越界 (范围 0-{self.column_num - 1})。"
             )
 
-    def plot_xvg_file(
-        self,
-        moveavg: bool = True,
-        window_size: int = 100,
-        ax: plt.Axes = None,
-        save_path: str = None,
-    ) -> None:
-        """
-        优化后的绘图函数。
-        Args:
-            ax: 可选的 matplotlib Axes 对象，用于在现有图形上绘制。
-            save_path: 可选保存路径，如果提供则立即保存图片。
-        """
-        # 获取数据 (假设第0列是X，第1列是Y)
-        xs = self.df.iloc[:, 0]
-        ys = self.df.iloc[:, 1]
-
-        # 设置画布
-        if ax is None:
-            fig, ax = plt.subplots(figsize=(12, 7), dpi=120)
-
-        color_raw = "#0066CC"
-        color_avg = "#004080"
-
-        # 绘制原始数据
-        ax.scatter(
-            xs,
-            ys,
-            color=color_raw,
-            alpha=0.5,
-            s=10,
-            label=f"{self.ylabel} (Row_data)",
-            zorder=3,
-        )
-
-        # 绘制移动平均
-        if moveavg:
-            # 计算逻辑：假设 X 轴是时间 (ps)
-            mvaves, _, _ = self.calc_mvave(window_size, 0.7, 1)
-            # mvaves 在起始处包含 NaNs，matplotlib 可以自动处理
-
-            # 估算时间窗口用于标签显示
-            try:
-                dt = xs.iloc[1] - xs.iloc[0]
-                time_window_ps = int(window_size * dt)
-                avg_label = f"{self.ylabel} ({time_window_ps}ps Avg)"
-            except:  # noqa: E722
-                avg_label = f"{self.ylabel} ({window_size} Avg)"
-
-            ax.plot(
-                xs,
-                mvaves,
-                color=color_avg,
-                linewidth=2.5,
-                alpha=0.9,
-                label=avg_label,
-                zorder=4,
-            )
-
-        # 装饰图表
-        ax.set_title(self.title, fontsize=16, pad=20, fontweight="bold")
-
-        ax.set_xlabel(self.xlabel, fontsize=14, labelpad=12, fontweight="bold")
-        print(self.xlabel)
-        ax.set_ylabel(self.ylabel, fontsize=14, labelpad=12, fontweight="bold")
-        ax.grid(True, linestyle="-", alpha=0.3, color="gray", linewidth=0.8)
-
-        ax.legend(fontsize=12, frameon=True, framealpha=0.8, loc="best", borderpad=0.5)
-        ax.tick_params(axis="both", which="major", labelsize=11)
-
-        if save_path:
-            plt.tight_layout()
-            plt.savefig(save_path, dpi=300)
-            print(f"图表已保存至: {save_path}")
-        elif ax is None:
-            # 如果是内部创建的 figure，显示或保存为默认名
-            default_out = self.xvgfile.replace(".xvg", "_plot.png")
-            plt.tight_layout()
-            plt.savefig(default_out, dpi=300)
-            print(f"图表已保存至: {default_out}")
-
     def apply_shift(self, threshold_x, shift_value, col_idx=1, operator=">="):
         """
-        根据 X 轴的值，对 Y 轴数据进行平移修正
-        :param threshold_x: X轴阈值
-        :param shift_value: 要加上的值 (可以是负数)
-        :param col_idx: 要修改的列索引，默认是1
-        :param operator: 判断条件 ">=" 或 "<="
+        根据 X 轴数值对 Y 轴数据进行平移修正 (处理周期性跳变等)。
+
+        Args:
+            threshold_x: X 轴阈值。
+            shift_value: 平移量 (加到 Y 轴)。
+            col_idx: 操作的列索引。
+            operator: 判断条件 ">=" 或 "<="。
         """
         if self.df is None or self.df.empty:
             return
-
         if operator == ">=":
             self.df.loc[self.df[0] >= threshold_x, col_idx] += shift_value
         elif operator == "<=":
             self.df.loc[self.df[0] <= threshold_x, col_idx] += shift_value
 
+    # =========================================================================
+    #  可视化功能 (Visualization - Integrated)
+    # =========================================================================
 
-class XVG_combiner:
-    """
-    XVG 合并工具类 (Pandas 优化版)。
-    用于将多个 XVG 文件的特定列合并为一个文件。
-    """
+    @staticmethod
+    def _generate_lighter_color(color, factor=0.4):
+        """
+        [内部工具] 生成指定颜色的浅色版本。
+        用于绘制原始数据的散点图，使其不喧宾夺主。
+        """
+        try:
+            c_rgb = mcolors.to_rgb(color)
+            h, l, s = colorsys.rgb_to_hls(*c_rgb)
+            # 提高亮度 (L)
+            new_l = l + (1.0 - l) * factor
+            return colorsys.hls_to_rgb(h, new_l, s)
+        except Exception:
+            return color
 
-    def __init__(
+    @staticmethod
+    def _setup_plot_style(ax, title, xlabel, ylabel, config):
+        """[内部工具] 应用标准图表样式 (标题、标签、网格等)。"""
+        ax.set_title(
+            title, fontsize=config["title_fontsize"], pad=20, fontweight="bold"
+        )
+        ax.set_xlabel(
+            xlabel, fontsize=config["label_fontsize"], labelpad=12, fontweight="bold"
+        )
+        ax.set_ylabel(
+            ylabel, fontsize=config["label_fontsize"], labelpad=12, fontweight="bold"
+        )
+
+        ax.grid(
+            True, linestyle="-", alpha=config["grid_alpha"], color="gray", linewidth=0.8
+        )
+
+        ax.tick_params(axis="both", which="major", labelsize=config["tick_fontsize"])
+        ax.legend(fontsize=12, frameon=True, framealpha=0.8, loc="best", borderpad=0.5)
+
+    def plot(
         self,
+        ax: Optional[plt.Axes] = None,
+        style: str = "professional",
+        color: Optional[str] = None,
+        window_size: Optional[int] = None,
+        show: bool = False,
+        save_path: Optional[str] = None,
+        auto_title: bool = True,
+    ) -> None:
+        """
+        [实例方法] 绘制当前 XVG 对象的数据。
+
+        Args:
+            ax: Matplotlib Axes 对象。如果为 None，则新建窗口。
+            style: 预设配色风格 ('professional', 'bright' 等)。
+            color: 强制指定主色调 (Hex 或 Name)。覆盖 style 设置。
+            window_size: 滑动平均窗口大小。None 则使用默认值 100。
+            show: 是否立即调用 plt.show()。
+            save_path: 图片保存路径。如果提供，将自动保存。
+            auto_title: 是否自动设置标题和轴标签。默认为 True。
+        """
+        if self.df.empty:
+            print("错误: 数据为空，无法绘图。")
+            return
+
+        config = self.STYLE_CONFIG
+        win_size = window_size if window_size is not None else config["window_size"]
+
+        # 1. 创建画布
+        if ax is None:
+            fig, ax = plt.subplots(figsize=config["figsize"], dpi=config["dpi"])
+
+        # 2. 确定颜色
+        if color is None:
+            cmap_name = self.COLORMAP_MAP.get(style, "viridis")
+            cmap = plt.get_cmap(cmap_name)
+            main_color = cmap(0.1)  # 默认取色带前端颜色
+        else:
+            main_color = color
+
+        scatter_color = self._generate_lighter_color(main_color, factor=0.4)
+
+        # 3. 准备数据 (默认 X=col0, Y=col1)
+        xs = self.df.iloc[:, 0]
+        ys = self.df.iloc[:, 1]
+
+        # 计算滑动平均曲线
+        try:
+            mvaves, _, _ = self.calc_mvave(win_size, 0.95, 1)
+            # 截去前端 NaN 部分以匹配绘图
+            xs_smooth = xs[win_size:]
+            ys_smooth = mvaves[win_size:]
+        except Exception:
+            # 数据不足或出错时，回退到原始数据
+            xs_smooth = xs
+            ys_smooth = ys
+
+        label_base = self.ylabel if self.ylabel else "Data"
+
+        # 4. 绘图
+        # 散点图 (原始数据背景)
+        ax.scatter(
+            xs,
+            ys,
+            color=scatter_color,
+            alpha=0.5,
+            s=config["scatter_size"],
+            label=f"{label_base} (Raw)",
+            zorder=3,
+        )
+        # 线图 (平滑趋势)
+        ax.plot(
+            xs_smooth,
+            ys_smooth,
+            color=main_color,
+            linewidth=config["line_width"],
+            alpha=0.9,
+            label=f"{label_base} (Avg)",
+            zorder=4,
+        )
+
+        # 5. 美化与保存
+        if auto_title:
+            self._setup_plot_style(ax, self.title, self.xlabel, self.ylabel, config)
+
+        if save_path:
+            plt.tight_layout()
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            print(f"图表已保存至: {save_path}")
+        elif ax is None and not show:
+            # 默认保存行为
+            default_out = self.xvgfile.replace(".xvg", "_plot.png")
+            plt.tight_layout()
+            plt.savefig(default_out, dpi=300, bbox_inches="tight")
+            print(f"图表已保存至: {default_out}")
+
+        if show:
+            plt.show()
+
+    @classmethod
+    def plot_files(
+        cls,
+        file_list: List[str],
+        style: str = "professional",
+        output_name: Optional[str] = None,
+        window_size: Optional[int] = None,
+        show: bool = True,
+    ):
+        """
+        [类方法] 批量读取并绘制多个 XVG 文件。
+        替代了原 visualization.py 中的功能。
+
+        Args:
+            file_list: 文件路径列表。
+            style: 配色风格。
+            output_name: 合成图表的保存路径。
+            window_size: 滑动平均窗口大小。
+            show: 是否显示图表窗口。
+        """
+        valid_files = [Path(f) for f in file_list if Path(f).exists()]
+        if not valid_files:
+            print("错误: 没有有效的文件可供绘制。")
+            return
+
+        config = cls.STYLE_CONFIG
+        win_size = window_size if window_size is not None else config["window_size"]
+
+        # 生成颜色序列
+        cmap_name = cls.COLORMAP_MAP.get(style, "viridis")
+        cmap = plt.get_cmap(cmap_name)
+        indices = np.linspace(0, 1, len(valid_files))
+        colors = [cmap(i) for i in indices]
+
+        fig, ax = plt.subplots(figsize=config["figsize"], dpi=config["dpi"])
+        meta_title, meta_xlabel, meta_ylabel = "Unknown", "X", "Y"
+
+        print(f"--- 开始批量绘制 (窗口大小: {win_size}) ---")
+
+        for i, file_path in enumerate(valid_files):
+            try:
+                xvg_obj = cls(str(file_path))
+
+                # 使用第一个文件的元数据作为主图标题
+                if i == 0:
+                    meta_title = xvg_obj.title
+                    meta_xlabel = xvg_obj.xlabel
+                    meta_ylabel = xvg_obj.ylabel
+
+                # 准备颜色和数据
+                main_color = colors[i]
+                scatter_color = cls._generate_lighter_color(main_color, factor=0.4)
+
+                xs = xvg_obj.data_columns[0]
+                ys = xvg_obj.data_columns[1]
+                mvaves, _, _ = xvg_obj.calc_mvave(win_size, 0.95, 1)
+
+                label_base = file_path.stem.replace(".xvg", "")
+
+                # 绘图
+                ax.scatter(
+                    xs,
+                    ys,
+                    color=scatter_color,
+                    alpha=0.5,
+                    s=config["scatter_size"],
+                    label=f"{label_base} (Raw)",
+                    zorder=3,
+                )
+                ax.plot(
+                    xs[win_size:],
+                    mvaves[win_size:],
+                    color=main_color,
+                    linewidth=config["line_width"],
+                    alpha=0.9,
+                    label=f"{label_base} (Avg)",
+                    zorder=4,
+                )
+
+                print(f"已处理: {file_path.name}")
+
+            except Exception as e:
+                print(f"错误: 处理文件 {file_path.name} 时失败: {e}")
+                continue
+
+        cls._setup_plot_style(ax, meta_title, meta_xlabel, meta_ylabel, config)
+        plt.tight_layout(pad=3.0)
+
+        if output_name:
+            save_path = output_name
+        else:
+            save_path = valid_files[0].parent / f"{valid_files[0].stem}_combined.png"
+
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"图表已保存至: {save_path}")
+        if show:
+            plt.show()
+
+    # =========================================================================
+    #  文件合并功能 (Merging - Integrated)
+    # =========================================================================
+
+    @classmethod
+    def combine_files(
+        cls,
         input_files: List[str],
         columns_to_extract: List[List[int]],
         output_file: str = "combined_output.xvg",
@@ -380,78 +608,70 @@ class XVG_combiner:
         end: Optional[int] = None,
         dt: int = 1,
         yshrink: float = 1.0,
-    ):
-        self.input_files = input_files
-        self.columns_to_extract = columns_to_extract
-        self.output_file = output_file
-        self.legends = legends
-        self.xlabel = xlabel
-        self.ylabel = ylabel
-        self.title = title
-        self.begin = begin
-        self.end = end
-        self.dt = dt
-        self.yshrink = yshrink
+    ) -> None:
+        """
+        [类方法] 合并多个 XVG 文件的特定列到一个新文件。
 
-        self._validate_inputs()
+        功能：
+            1. 读取每个文件的指定列 (columns_to_extract)。
+            2. 对齐时间轴 (默认以第一个文件为准)。
+            3. 将所有提取的数据列组合成一个新的宽表 DataFrame。
+            4. 输出为新的 .xvg 文件。
 
-    def _validate_inputs(self):
-        if not self.input_files:
+        Args:
+            input_files: 输入文件路径列表。
+            columns_to_extract: 每个文件对应的要提取的列索引列表。
+                                例如 [[0, 1], [1]] 表示第一个文件取第0,1列，第二个取第1列。
+            output_file: 输出文件路径。
+            legends: 自定义图例列表（可选，若不填则尝试自动获取）。
+            xlabel, ylabel, title: 自定义元数据（可选）。
+            begin, end, dt: 数据切片参数。
+            yshrink: Y 轴数据缩放因子 (乘数)。
+        """
+        # 1. 验证输入
+        if not input_files:
             raise ValueError("输入文件列表不能为空。")
-        if len(self.input_files) != len(self.columns_to_extract):
+        if len(input_files) != len(columns_to_extract):
             raise ValueError("输入文件数量与提取列配置的数量不匹配。")
-        # 实际运行时请取消注释以下检查（模拟环境中不检查文件存在性）
-        # for f in self.input_files:
-        #     if not os.path.exists(f):
-        #         raise FileNotFoundError(f"未找到文件: {f}")
 
-    def combine(self):
-        """执行 XVG 文件合并过程 (优化版)。"""
         print("开始合并 XVG 文件 (Optimized)...")
 
-        # 1. 初始化
         collected_titles = []
         final_legends = []
-
-        # 使用字典收集数据列，最后一次性构建 DataFrame，效率高于逐列赋值
         data_dict = {}
 
-        # 准备图例迭代器，方便按需提取
-        legend_iter = iter(self.legends) if self.legends else None
+        # 图例迭代器
+        legend_iter = iter(legends) if legends else None
 
-        # 2. 读取第一个文件作为基准 (Reference)
-        # 假设 XVG 类读取文件开销较大，我们只在循环外初始化一次 ref_xvg
-        # 如果 self.input_files[0] 在后续也需要处理，我们已经在循环逻辑中覆盖了
-        ref_xvg = XVG(self.input_files[0])
+        # 读取第一个文件作为基准 (Reference)
+        ref_xvg = cls(input_files[0])
 
-        # 定义切片对象，pandas 支持 slice 对象直接索引
-        # 如果 end 是 None，slice 会自动处理到末尾
-        slice_obj = slice(self.begin, self.end, self.dt)
+        # 定义切片对象
+        slice_obj = slice(begin, end, dt)
 
-        # 提取时间轴 (基准)
-        # .values 转换为 numpy array，避免索引对齐问题，且速度更快
+        # 提取时间轴 (Time)
         time_data = ref_xvg.df.iloc[slice_obj, 0].values
         data_dict["Time"] = time_data
 
-        # 3. 迭代处理文件
-        for f_idx, filename in enumerate(self.input_files):
-            # 优化：如果是第一个文件，复用 ref_xvg，避免重复 IO
+        # 迭代处理所有文件
+        for f_idx, filename in enumerate(input_files):
+            # 优化：复用第一个文件的对象，避免重复读取
             if f_idx == 0:
                 current_xvg = ref_xvg
             else:
-                current_xvg = XVG(filename)
+                current_xvg = cls(filename)
 
-            # 收集标题
+            # 收集标题以供参考
             if current_xvg.title and current_xvg.title not in collected_titles:
                 collected_titles.append(current_xvg.title)
 
-            # 获取当前文件需要提取的列索引列表
-            target_cols = self.columns_to_extract[f_idx]
-
-            # 过滤列：如果不是第一个文件，跳过索引为 0 的列 (Time)
+            target_cols = columns_to_extract[f_idx]
             valid_cols = []
+
+            # 过滤列索引
             for col_idx in target_cols:
-                current_xvg.check_column_index(col_idx)  # 保留原有的检查逻辑
+                current_xvg.check_column_index(col_idx)
+                # 警告并跳过：除了第一个文件外，不要重复提取时间列(0)
                 if f_idx > 0 and col_idx == 0:
                     print(f"警告: 已跳过 {filename} 的时间列 (0) 以避免重复。")
                     continue
@@ -460,95 +680,56 @@ class XVG_combiner:
             if not valid_cols:
                 continue
 
-            # --- 核心优化点 ---
-            # 批量提取数据：一次 iloc 提取所有列，而不是在循环中提取
-            # 乘以标量 yshrink 是向量化操作，非常快
-            extracted_block = current_xvg.df.iloc[slice_obj, valid_cols] * self.yshrink
+            # 批量提取数据并应用缩放
+            extracted_block = current_xvg.df.iloc[slice_obj, valid_cols] * yshrink
 
-            # 遍历提取出的块，分配图例名称并存入字典
-            # zip(valid_cols, range(len(valid_cols))) 用于对应原始列号和提取块中的位置
             for i, original_col_idx in enumerate(valid_cols):
-                # 获取数据列 (Series -> numpy array)
-                # 使用 .values 确保长度对齐，忽略原始索引
                 col_data = extracted_block.iloc[:, i].values
 
-                # 检查数据长度一致性
+                # 长度对齐处理 (取交集长度)
                 if len(col_data) != len(time_data):
-                    # 简单截断或填充以匹配时间轴 (根据 Time 列长度)
-                    # 这里选择切片以匹配较短者，保证 DataFrame 创建成功
                     min_len = min(len(col_data), len(time_data))
                     col_data = col_data[:min_len]
-                    # 注意：如果数据严重不齐，可能需要更复杂的 merge 逻辑，但为了保持原功能接口，此处做简单处理
 
-                # 确定列名/图例
+                # --- 确定图例名称 (优先级: 自定义 > 源文件图例 > 自动命名) ---
                 col_name = None
 
-                # 1. 尝试使用用户提供的覆盖图例
+                # 1. 优先使用传入的 legends
                 if legend_iter:
                     try:
                         col_name = next(legend_iter)
                     except StopIteration:
                         pass
 
-                # 2. 如果未提供，尝试从源文件自动获取
+                # 2. 尝试从源文件获取 legend
                 if col_name is None:
-                    # 假设 XVG 对象的 legends 属性存储了 Y 轴的标签
-                    # 通常第0列是 Time，所以 legend index = col_idx - 1
                     if hasattr(current_xvg, "legends") and current_xvg.legends:
-                        # 计算对应的 legend索引
-                        # 注意：这里假设 legends 列表不包含 Time 列的说明
+                        # 假设 XVG legends 列表不包含 Time 列 (即 col 0)，所以 index = col_idx - 1
                         leg_idx = original_col_idx - 1
                         if 0 <= leg_idx < len(current_xvg.legends):
                             col_name = current_xvg.legends[leg_idx]
 
-                # 3. 最后的兜底命名
+                # 3. 默认命名
                 if col_name is None:
                     col_name = f"File{f_idx}_Col{original_col_idx}"
 
                 final_legends.append(col_name)
                 data_dict[col_name] = col_data
 
-        # 4. 构建最终 DataFrame
-        # dict -> DataFrame 非常高效
+        # 2. 构建最终 DataFrame
         combined_df = pd.DataFrame(data_dict)
 
-        # 5. 输出保存
-        out_xvg = XVG(self.output_file, is_file=False, new_file=True)
+        # 3. 创建输出对象
+        out_xvg = cls(output_file, is_file=False, new_file=True)
+        out_xvg.df = combined_df
 
         # 填充元数据
-        out_xvg.title = self.title if self.title else " & ".join(collected_titles)
-        out_xvg.xlabel = self.xlabel if self.xlabel else ref_xvg.xlabel
-        out_xvg.ylabel = self.ylabel if self.ylabel else ref_xvg.ylabel
+        out_xvg.title = title if title else " & ".join(collected_titles)
+        out_xvg.xlabel = xlabel if xlabel else ref_xvg.xlabel
+        out_xvg.ylabel = ylabel if ylabel else ref_xvg.ylabel
         out_xvg.legends = final_legends
         out_xvg.comments.append(
-            f"# 合并自 {len(self.input_files)} 个文件 (Pandas Optimized)。"
+            f"# 合并自 {len(input_files)} 个文件 (Pandas Optimized)。"
         )
 
-        out_xvg.df = combined_df
-        out_xvg.save(self.output_file)
-
-
-# -----------------------------------------------------------
-# 使用示例 / Example Usage
-# -----------------------------------------------------------
-if __name__ == "__main__":
-    # 1. 单个文件分析示例
-    try:
-        # 假设有个文件叫 energy.xvg
-        xvg = XVG("/mnt/d/yry/50_poly_box/pull/25000/pull_pullf_new.xvg")
-        xvg.plot_xvg_file(
-            window_size=50,
-            save_path="/mnt/d/yry/50_poly_box/pull/25000/pull_pullf_new.png",
-        )
-        pass
-    except Exception as e:
-        print(e)
-
-    # 2. 合并文件示例
-    files = [
-        "/mnt/d/yry/50_poly_box/data/energy/Coul_SR/summed_all_pairs_Coul_SR.xvg",
-        "/mnt/d/yry/50_poly_box/data/energy/LJ-SR/LJ_SR.xvg",
-    ]
-    cols = [[0, 1], [1]]  # 提取每个文件的第1列
-    combiner = XVG_combiner(files, cols, output_file="merged.xvg")
-    combiner.combine()
+        out_xvg.save(output_file)
