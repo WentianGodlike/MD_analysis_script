@@ -262,6 +262,35 @@ class XVG:
     # =========================================================================
     #  数据计算与处理 (Computation)
     # =========================================================================
+    # 在 XVG 类中添加
+
+    def aggregate_columns(self, operation="sum", start_col=1) -> "XVG":
+        """创建一个新的 XVG 对象，其中包含时间列和其余列的聚合结果"""
+        if self.df.empty:
+            raise ValueError("数据为空")
+
+        time_col = self.df.iloc[:, 0]
+        data_cols = self.df.iloc[:, start_col:]
+
+        if operation == "sum":
+            agg_res = data_cols.sum(axis=1)
+            suffix = "Sum"
+        elif operation == "mean":
+            agg_res = data_cols.mean(axis=1)
+            suffix = "Mean"
+        else:
+            raise ValueError(f"不支持的操作: {operation}")
+
+        new_df = pd.DataFrame({0: time_col, 1: agg_res})
+
+        new_xvg = XVG(self.xvgfile, is_file=False, new_file=True)
+        new_xvg.df = new_df
+        new_xvg.title = f"{self.title} ({suffix})"
+        new_xvg.xlabel = self.xlabel
+        new_xvg.ylabel = self.ylabel
+        new_xvg.legends = [f"Total_{suffix}"]
+
+        return new_xvg
 
     def calc_mvave(
         self, windowsize: int, confidence: float, column_index: int
@@ -365,7 +394,7 @@ class XVG:
         """
         try:
             c_rgb = mcolors.to_rgb(color)
-            h, l, s = colorsys.rgb_to_hls(*c_rgb)
+            h, l, s = colorsys.rgb_to_hls(*c_rgb)  # noqa: E741
             # 提高亮度 (L)
             new_l = l + (1.0 - l) * factor
             return colorsys.hls_to_rgb(h, new_l, s)
