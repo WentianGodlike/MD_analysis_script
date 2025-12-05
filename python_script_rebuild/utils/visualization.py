@@ -8,7 +8,7 @@ import sys
 
 # 尝试导入 XVG 处理器，如果不存在则提示
 try:
-    from xvg_handler import XVG  # pyright: ignore[reportMissingImports]
+    from utils.xvg_handler import XVG
 except ImportError:
     print(
         "错误: 找不到 'xvg_handler.py' 模块。请确保它在同一目录下或在 PYTHONPATH 中。"
